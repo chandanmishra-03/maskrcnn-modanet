@@ -22,6 +22,12 @@ maskrcnn-modanet train --epochs 15 --workers 0 --batch-size 1 coco
 import argparse
 import os
 import sys
+# import comet_ml in the top of your file
+from comet_ml import Experiment
+
+# Add the following code anywhere in your machine learning file
+experiment = Experiment(api_key="HFZFSbhqA92gfY0DT1ZCOnk9Y",
+                        project_name="mask-rcnn", workspace="chandan")
 
 import keras
 import keras.preprocessing.image

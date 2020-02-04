@@ -36,7 +36,8 @@ setuptools.setup(
 			'pycocotools',
 			'matplotlib',
 			'tensorflow',
-			'instaloader'
+			'instaloader',
+			'comet_ml'
 		],
 		entry_points = {
 		    'console_scripts': [

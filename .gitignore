@@ -8,3 +8,5 @@ data/*
 share
 __pycache__
 dist
+.idea
+.idea/
