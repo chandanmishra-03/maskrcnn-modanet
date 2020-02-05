@@ -238,6 +238,7 @@ def save():
 	''' Save result. image or annotations '''
 	pass
 
+
 @view.command()
 @click.option('-p', '--proc-img-path')
 @click.option('-u', '--proc-img-url', callback=validators.check_if_url_downloadable)

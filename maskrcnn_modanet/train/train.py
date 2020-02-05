@@ -21,7 +21,7 @@ maskrcnn-modanet train --epochs 15 --workers 0 --batch-size 1 coco
 
 import argparse
 import os
-import sys
+
 # import comet_ml in the top of your file
 from comet_ml import Experiment
 
@@ -32,13 +32,15 @@ experiment = Experiment(api_key="HFZFSbhqA92gfY0DT1ZCOnk9Y",
 import keras
 import keras.preprocessing.image
 import tensorflow as tf
-
+import keras.backend as K
 import keras_retinanet.losses
 from keras_retinanet.callbacks import RedirectModel
 from keras_retinanet.utils.config import read_config_file, parse_anchor_parameters
 from keras_retinanet.utils.transform import random_transform_generator
 from keras_retinanet.utils.keras_version import check_keras_version
 from keras_retinanet.utils.model import freeze as freeze_model
+import keras.layers as KL
+import keras.models as KM
 
 # Allow relative imports when being executed as script.
 # if __name__ == "__main__" and __package__ is None:
@@ -64,31 +66,118 @@ def model_with_weights(model, weights, skip_mismatch):
     return model
 
 
-def create_models(backbone_retinanet, num_classes, weights, freeze_backbone=False, class_specific_filter=True, anchor_params=None):
-    modifier = freeze_model if freeze_backbone else None
+class ParallelModel(KM.Model):
+    """Subclasses the standard Keras Model and adds multi-GPU support.
+    It works by creating a copy of the model on each GPU. Then it slices
+    the inputs and sends a slice to each copy of the model, and then
+    merges the outputs together and applies the loss on the combined
+    outputs.
+    """
 
-    model            = model_with_weights(
-        backbone_retinanet(
-            num_classes,
-            nms=True,
-            class_specific_filter=class_specific_filter,
-            modifier=modifier,
-            anchor_params=anchor_params
-        ), weights=weights, skip_mismatch=True)
-    training_model   = model
-    prediction_model = model
+    def __init__(self, keras_model, gpu_count):
+        """Class constructor.
+        keras_model: The Keras model to parallelize
+        gpu_count: Number of GPUs. Must be > 1
+        """
+        self.inner_model = keras_model
+        self.gpu_count = gpu_count
+        merged_outputs = self.make_parallel()
+        super(ParallelModel, self).__init__(inputs=self.inner_model.inputs,
+                                            outputs=merged_outputs)
 
-    # compile model
-    training_model.compile(
-        loss={
-            'regression'    : keras_retinanet.losses.smooth_l1(),
-            'classification': keras_retinanet.losses.focal(),
-            'masks'         : losses.mask(),
-        },
-        optimizer=keras.optimizers.adam(lr=1e-5, clipnorm=0.001)
-    )
+    def __getattribute__(self, attrname):
+        """Redirect loading and saving methods to the inner model. That's where
+        the weights are stored."""
+        if 'load' in attrname or 'save' in attrname:
+            return getattr(self.inner_model, attrname)
+        return super(ParallelModel, self).__getattribute__(attrname)
 
-    return model, training_model, prediction_model
+    def summary(self, *args, **kwargs):
+        """Override summary() to display summaries of both, the wrapper
+        and inner models."""
+        super(ParallelModel, self).summary(*args, **kwargs)
+        self.inner_model.summary(*args, **kwargs)
+
+    def make_parallel(self):
+        """Creates a new wrapper model that consists of multiple replicas of
+        the original model placed on different GPUs.
+        """
+        # Slice inputs. Slice inputs on the CPU to avoid sending a copy
+        # of the full inputs to all GPUs. Saves on bandwidth and memory.
+        input_slices = {name: tf.split(x, self.gpu_count)
+                        for name, x in zip(self.inner_model.input_names,
+                                           self.inner_model.inputs)}
+
+        output_names = self.inner_model.output_names
+        outputs_all = []
+        for i in range(len(self.inner_model.outputs)):
+            outputs_all.append([])
+
+        # Run the model call() on each GPU to place the ops there
+        for i in range(self.gpu_count):
+            with tf.device('/gpu:%d' % i):
+                with tf.name_scope('tower_%d' % i):
+                    # Run a slice of inputs through this replica
+                    zipped_inputs = zip(self.inner_model.input_names,
+                                        self.inner_model.inputs)
+                    inputs = [
+                        KL.Lambda(lambda s: input_slices[name][i],
+                                  output_shape=lambda s: (None,) + s[1:])(tensor)
+                        for name, tensor in zipped_inputs]
+                    # Create the model replica and get the outputs
+                    outputs = self.inner_model(inputs)
+                    if not isinstance(outputs, list):
+                        outputs = [outputs]
+                    # Save the outputs for merging back together later
+                    for l, o in enumerate(outputs):
+                        outputs_all[l].append(o)
+
+        # Merge outputs on CPU
+        with tf.device('/cpu:0'):
+            merged = []
+            for outputs, name in zip(outputs_all, output_names):
+                # If outputs are numbers without dimensions, add a batch dim.
+                def add_dim(tensor):
+                    """Add a dimension to tensors that don't have any."""
+                    if K.int_shape(tensor) == ():
+                        return KL.Lambda(lambda t: K.reshape(t, [1, 1]))(tensor)
+                    return tensor
+
+                outputs = list(map(add_dim, outputs))
+
+                # Concatenate
+                merged.append(KL.Concatenate(axis=0, name=name)(outputs))
+        return merged
+
+    def create_models(backbone_retinanet, num_classes, weights, freeze_backbone=False, class_specific_filter=True,
+                      anchor_params=None):
+
+        modifier = freeze_model if freeze_backbone else None
+
+        model = model_with_weights(
+            backbone_retinanet(
+                num_classes,
+                nms=True,
+                class_specific_filter=class_specific_filter,
+                modifier=modifier,
+                anchor_params=anchor_params
+            ), weights=weights, skip_mismatch=True)
+        GPU_COUNT = 2
+        model = ParallelModel(model, GPU_COUNT)
+        training_model = model
+        prediction_model = model
+
+        # compile model
+        training_model.compile(
+            loss={
+                'regression': keras_retinanet.losses.smooth_l1(),
+                'classification': keras_retinanet.losses.focal(),
+                'masks': losses.mask(),
+            },
+            optimizer=keras.optimizers.adam(lr=1e-5, clipnorm=0.001)
+        )
+
+        return model, training_model, prediction_model
 
 
 def create_callbacks(model, training_model, prediction_model, validation_generator, args):
@@ -101,7 +190,8 @@ def create_callbacks(model, training_model, prediction_model, validation_generat
         checkpoint = keras.callbacks.ModelCheckpoint(
             os.path.join(
                 args.snapshot_path,
-                '{backbone}_{dataset_type}_{{epoch:02d}}.h5'.format(backbone=args.backbone, dataset_type=args.dataset_type)
+                '{backbone}_{dataset_type}_{{epoch:02d}}.h5'.format(backbone=args.backbone,
+                                                                    dataset_type=args.dataset_type)
             ),
             verbose=1
         )
@@ -112,15 +202,15 @@ def create_callbacks(model, training_model, prediction_model, validation_generat
 
     if args.tensorboard_dir:
         tensorboard_callback = keras.callbacks.TensorBoard(
-            log_dir                = args.tensorboard_dir,
-            histogram_freq         = 0,
-            batch_size             = args.batch_size,
-            write_graph            = True,
-            write_grads            = False,
-            write_images           = False,
-            embeddings_freq        = 0,
-            embeddings_layer_names = None,
-            embeddings_metadata    = None
+            log_dir=args.tensorboard_dir,
+            histogram_freq=0,
+            batch_size=args.batch_size,
+            write_graph=True,
+            write_grads=False,
+            write_images=False,
+            embeddings_freq=0,
+            embeddings_layer_names=None,
+            embeddings_metadata=None
         )
         callbacks.append(tensorboard_callback)
 
@@ -131,19 +221,20 @@ def create_callbacks(model, training_model, prediction_model, validation_generat
             # use prediction model for evaluation
             evaluation = CocoEval(validation_generator)
         else:
-            evaluation = Evaluate(validation_generator, tensorboard=tensorboard_callback, weighted_average=args.weighted_average)
+            evaluation = Evaluate(validation_generator, tensorboard=tensorboard_callback,
+                                  weighted_average=args.weighted_average)
         evaluation = RedirectModel(evaluation, prediction_model)
         callbacks.append(evaluation)
 
     callbacks.append(keras.callbacks.ReduceLROnPlateau(
-        monitor  = 'loss',
-        factor   = 0.1,
-        patience = 2,
-        verbose  = 1,
-        mode     = 'auto',
-        epsilon  = 0.0001,
-        cooldown = 0,
-        min_lr   = 0
+        monitor='loss',
+        factor=0.1,
+        patience=2,
+        verbose=1,
+        mode='auto',
+        epsilon=0.0001,
+        cooldown=0,
+        min_lr=0
     ))
 
     return callbacks
@@ -219,49 +310,65 @@ def check_args(parsed_args):
 
 
 def parse_args(args, savedvars):
-    parser     = argparse.ArgumentParser(prog='maskrcnn-modanet train', description='Simple training script for training a RetinaNet mask network.')
+    parser = argparse.ArgumentParser(prog='maskrcnn-modanet train',
+                                     description='Simple training script for training a RetinaNet mask network.')
     subparsers = parser.add_subparsers(help='Arguments for specific dataset types.', dest='dataset_type')
     subparsers.required = True
 
     coco_parser = subparsers.add_parser('coco')
-    coco_parser.add_argument('--coco-path', help='Path to dataset directory (ie. /tmp/COCO).', default=savedvars['datapath'] + 'datasets/coco/')
+    coco_parser.add_argument('--coco-path', help='Path to dataset directory (ie. /tmp/COCO).',
+                             default=savedvars['datapath'] + 'datasets/coco/')
 
     csv_parser = subparsers.add_parser('csv')
     csv_parser.add_argument('annotations', help='Path to CSV file containing annotations for training.')
     csv_parser.add_argument('classes', help='Path to a CSV file containing class label mapping.')
-    csv_parser.add_argument('--val-annotations', help='Path to CSV file containing annotations for validation (optional).')
-
+    csv_parser.add_argument('--val-annotations',
+                            help='Path to CSV file containing annotations for validation (optional).')
 
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--snapshot',          help='Resume training from a snapshot.')
-    group.add_argument('--imagenet-weights',  help='Initialize the model with pretrained imagenet weights. This is the default behaviour.', action='store_const', const=True, default=True)
-    group.add_argument('--weights',           help='Initialize the model with weights from a file.')
-    group.add_argument('--no-weights',        help='Don\'t initialize the model with any weights.', dest='imagenet_weights', action='store_const', const=False)
+    group.add_argument('--snapshot', help='Resume training from a snapshot.')
+    group.add_argument('--imagenet-weights',
+                       help='Initialize the model with pretrained imagenet weights. This is the default behaviour.',
+                       action='store_const', const=True, default=True)
+    group.add_argument('--weights', help='Initialize the model with weights from a file.')
+    group.add_argument('--no-weights', help='Don\'t initialize the model with any weights.', dest='imagenet_weights',
+                       action='store_const', const=False)
 
-    parser.add_argument('--backbone',         help='Backbone model used by retinanet.', default='resnet50', type=str)
-    parser.add_argument('--batch-size',       help='Size of the batches.', default=1, type=int)
-    parser.add_argument('--gpu',              help='Id of the GPU to use (as reported by nvidia-smi).')
-    parser.add_argument('--epochs',           help='Number of epochs to train.', type=int, default=50)
-    parser.add_argument('--steps',            help='Number of steps per epoch.', type=int, default=10000)
-    parser.add_argument('--snapshot-path',    help='Path to store snapshots of models during training (defaults to \'yourpath/results/snapshots/\')', default=savedvars['datapath'] + 'results/snapshots/')
-    parser.add_argument('--tensorboard-dir',  help='Log directory for Tensorboard output', default=savedvars['datapath'] + 'results/logs/')
-    parser.add_argument('--no-snapshots',     help='Disable saving snapshots.', dest='snapshots', action='store_false')
-    parser.add_argument('--no-evaluation',    help='Disable per epoch evaluation.', dest='evaluation', action='store_false')
-    parser.add_argument('--freeze-backbone',  help='Freeze training of backbone layers.', action='store_true')
-    parser.add_argument('--no-class-specific-filter', help='Disables class specific filtering.', dest='class_specific_filter', action='store_false')
-    parser.add_argument('--config',           help='Path to a configuration parameters .ini file.')
-    parser.add_argument('--weighted-average', help='Compute the mAP using the weighted average of precisions among classes.', action='store_true')
+    parser.add_argument('--backbone', help='Backbone model used by retinanet.', default='resnet50', type=str)
+    parser.add_argument('--batch-size', help='Size of the batches.', default=1, type=int)
+    parser.add_argument('--gpu', help='Id of the GPU to use (as reported by nvidia-smi).')
+    parser.add_argument('--epochs', help='Number of epochs to train.', type=int, default=50)
+    parser.add_argument('--steps', help='Number of steps per epoch.', type=int, default=10000)
+    parser.add_argument('--snapshot-path',
+                        help='Path to store snapshots of models during training (defaults to '
+                             '\'yourpath/results/snapshots/\')',
+                        default=savedvars['datapath'] + 'results/snapshots/')
+    parser.add_argument('--tensorboard-dir', help='Log directory for Tensorboard output',
+                        default=savedvars['datapath'] + 'results/logs/')
+    parser.add_argument('--no-snapshots', help='Disable saving snapshots.', dest='snapshots', action='store_false')
+    parser.add_argument('--no-evaluation', help='Disable per epoch evaluation.', dest='evaluation',
+                        action='store_false')
+    parser.add_argument('--freeze-backbone', help='Freeze training of backbone layers.', action='store_true')
+    parser.add_argument('--no-class-specific-filter', help='Disables class specific filtering.',
+                        dest='class_specific_filter', action='store_false')
+    parser.add_argument('--config', help='Path to a configuration parameters .ini file.')
+    parser.add_argument('--weighted-average',
+                        help='Compute the mAP using the weighted average of precisions among classes.',
+                        action='store_true')
 
     # Fit generator arguments
-    parser.add_argument('--workers', help='Number of multiprocessing workers. To disable multiprocessing, set workers to 0', type=int, default=1)
-    parser.add_argument('--max-queue-size', help='Queue length for multiprocessing workers in fit generator.', type=int, default=10)
+    parser.add_argument('--workers',
+                        help='Number of multiprocessing workers. To disable multiprocessing, set workers to 0',
+                        type=int, default=1)
+    parser.add_argument('--max-queue-size', help='Queue length for multiprocessing workers in fit generator.', type=int,
+                        default=10)
 
     return check_args(parser.parse_args(args))
 
 
 def main(args=None):
     import json
-    with open(os.path.expanduser('~')+ '/.maskrcnn-modanet/' + 'savedvars.json') as f:
+    with open(os.path.expanduser('~') + '/.maskrcnn-modanet/' + 'savedvars.json') as f:
         savedvars = json.load(f)
 
     # parse arguments
@@ -275,7 +382,7 @@ def main(args=None):
 
     # create object that stores backbone information
     backbone = models.backbone(args.backbone)
-    
+
     # optionally choose specific GPU
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -291,8 +398,8 @@ def main(args=None):
     # create the model
     if args.snapshot is not None:
         print('Loading model, this may take a second...')
-        model            = models.load_model(args.snapshot, backbone_name=args.backbone)
-        training_model   = model
+        model = models.load_model(args.snapshot, backbone_name=args.backbone)
+        training_model = model
         prediction_model = model
     else:
         weights = args.weights
@@ -332,7 +439,6 @@ def main(args=None):
     else:
         use_multiprocessing = False
 
-
     # start training
     training_model.fit_generator(
         generator=train_generator,
@@ -344,6 +450,7 @@ def main(args=None):
         use_multiprocessing=use_multiprocessing,
         max_queue_size=args.max_queue_size
     )
+
 
 if __name__ == '__main__':
     main()

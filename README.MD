@@ -55,6 +55,10 @@ Say you want to quickly find what skirt (or footwear) your instagram star always
 [Short Version](https://docs.google.com/uc?id=1Tua2xs1DoY4Kv_bHwbF_rflgV8E7iTUq)
 
 ## Getting Started
+```bash
+
+maskrcnn-modanet train --epochs 25 --batch-size 5 --workers 5  --max-queue-size 30 coco
+```
 
 This project is written in Python 3, so it works in all major OSes. Although only Linux and MacOS are fully supported.
 Keep in mind to use pip or pip3 depending on your settings.
