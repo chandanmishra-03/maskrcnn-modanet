@@ -172,7 +172,7 @@ def create_models(backbone_retinanet, num_classes, weights, freeze_backbone=Fals
             anchor_params=anchor_params
         ), weights=weights, skip_mismatch=True)
     GPU_COUNT = 2
-    model = ParallelModel(model, GPU_COUNT)
+    # model = ParallelModel(model, GPU_COUNT)
 
     # model = keras.utils.multi_gpu_model(model, gpus=2)
     training_model = model
