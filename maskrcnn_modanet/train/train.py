@@ -77,7 +77,7 @@ def create_models(backbone_retinanet, num_classes, weights, freeze_backbone=Fals
         ), weights=weights, skip_mismatch=True)
     training_model   = model
     prediction_model = model
-
+    #model = keras.utils.multi_gpu_model(model, gpus=2)
     # compile model
     training_model.compile(
         loss={

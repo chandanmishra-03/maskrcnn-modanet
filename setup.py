@@ -35,7 +35,7 @@ setuptools.setup(
 			'numpy',
 			'pycocotools',
 			'matplotlib',
-			'tensorflow',
+			'tensorflow-gpu',
 			'instaloader',
 			'comet_ml'
 		],
